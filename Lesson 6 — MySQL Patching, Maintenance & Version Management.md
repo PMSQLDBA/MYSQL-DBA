@@ -1,4 +1,4 @@
-# Lesson 6 of 10 — MySQL Patching, Maintenance & Version Management
+# Lesson 6 — MySQL Patching, Maintenance & Version Management
 
 This lesson teaches you how a DBA safely manages MySQL versions in **production**, including **Windows and Linux**.
 
