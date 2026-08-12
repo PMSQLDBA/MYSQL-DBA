@@ -1,0 +1,1972 @@
+# Lesson 8 of 10 — MySQL Replication, High Availability & Disaster Recovery
+
+This is one of the most important DBA lessons.
+
+By the end, you should understand how to design and operate:
+
+```text
+MySQL Source → Replica
+GTID
+Binary logs
+Replication lag
+Read replicas
+Switchover
+Failover
+High Availability
+Disaster Recovery
+Replication troubleshooting
+```
+
+---
+
+# 1. What Is Replication?
+
+MySQL replication copies database changes from one MySQL server to another.
+
+Basic architecture:
+
+```text
+             SOURCE
+          MySQL Server
+               |
+               | Binary Log
+               |
+               v
+             REPLICA
+          MySQL Server
+```
+
+The source handles changes.
+
+The replica receives and applies those changes.
+
+---
+
+# 2. Why Use Replication?
+
+Replication can provide:
+
+```text
+Read scaling
+High availability
+Disaster recovery
+Reporting
+Backup support
+Migration
+Geographic redundancy
+```
+
+But:
+
+> **Replication is not a backup.**
+
+This distinction is critical.
+
+---
+
+# 3. Replication Is Not Backup
+
+Suppose someone runs:
+
+```sql
+DROP DATABASE production;
+```
+
+on the source.
+
+Replication may faithfully replicate that destructive operation.
+
+Result:
+
+```text
+SOURCE
+DROP DATABASE
+      |
+      v
+REPLICA
+DROP DATABASE
+```
+
+So:
+
+```text
+Replication
+    ≠
+Backup
+```
+
+You need both.
+
+---
+
+# 4. Basic Replication Architecture
+
+```text
+                 Application
+                     |
+                     v
+                  SOURCE
+                     |
+              Binary Log
+                     |
+          +----------+----------+
+          |                     |
+          v                     v
+      REPLICA 1              REPLICA 2
+          |                     |
+          v                     v
+       Reporting             DR
+```
+
+This is a common pattern.
+
+---
+
+# 5. Binary Log
+
+The binary log is central to MySQL replication.
+
+It records changes/events that can be used for replication and point-in-time recovery.
+
+Conceptually:
+
+```text
+SQL transaction
+      |
+      v
+Binary Log
+      |
+      +------> Replica
+      |
+      +------> Backup/PITR
+```
+
+---
+
+# 6. Check Binary Logging
+
+Run:
+
+```sql
+SHOW VARIABLES LIKE 'log_bin';
+```
+
+You generally want:
+
+```text
+log_bin = ON
+```
+
+for a server intended to act as a replication source.
+
+Check the format:
+
+```sql
+SHOW VARIABLES LIKE 'binlog_format';
+```
+
+Modern MySQL environments commonly use row-based logging.
+
+---
+
+# 7. Binary Log Files
+
+You can inspect:
+
+```sql
+SHOW BINARY LOG STATUS;
+```
+
+Depending on your MySQL version, commands and output may differ from older tutorials.
+
+You may see information such as:
+
+```text
+File
+Position
+GTID
+```
+
+These identify the current binary-log state.
+
+---
+
+# 8. GTID
+
+GTID means:
+
+> **Global Transaction Identifier**
+
+Instead of relying only on:
+
+```text
+binlog-file + position
+```
+
+transactions can be identified using GTIDs.
+
+Conceptually:
+
+```text
+Server UUID
+     +
+Transaction Number
+     =
+GTID
+```
+
+Example conceptually:
+
+```text
+aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:12345
+```
+
+---
+
+# 9. Why GTID Is Useful
+
+Without GTID:
+
+```text
+Source
+binlog.000123
+position 456789
+```
+
+Replication configuration can depend heavily on exact binary-log coordinates.
+
+With GTID:
+
+```text
+Transaction
+      ↓
+Unique identity
+      ↓
+Replica knows what it has already executed
+```
+
+This can greatly simplify replication administration and failover.
+
+---
+
+# 10. Check GTID
+
+```sql
+SHOW VARIABLES LIKE 'gtid_mode';
+```
+
+You may also inspect:
+
+```sql
+SHOW VARIABLES LIKE 'enforce_gtid_consistency';
+```
+
+A typical modern HA design deliberately plans around GTIDs.
+
+---
+
+# 11. Source and Replica Terminology
+
+Older MySQL documentation commonly used:
+
+```text
+Master
+Slave
+```
+
+Modern terminology uses:
+
+```text
+Source
+Replica
+```
+
+Use the modern terminology in your DBA work.
+
+---
+
+# 12. Replication Flow
+
+At a high level:
+
+```text
+1. Client writes to Source
+          ↓
+2. Transaction commits
+          ↓
+3. Event written to binary log
+          ↓
+4. Replica receives event
+          ↓
+5. Replica processes event
+          ↓
+6. Replica applies transaction
+```
+
+Conceptually:
+
+```text
+SOURCE
+  |
+  | Binary Log
+  v
+Receiver
+  |
+  v
+Relay Log
+  |
+  v
+Applier
+  |
+  v
+Replica Data
+```
+
+---
+
+# 13. Relay Log
+
+The replica receives source events and stores them locally in relay logs.
+
+Think:
+
+```text
+SOURCE
+   |
+   | binlog
+   v
+REPLICA
+   |
+   v
+Relay Log
+   |
+   v
+Apply
+   |
+   v
+Database
+```
+
+The relay log is part of the replication mechanism.
+
+---
+
+# 14. Replication Threads
+
+Conceptually, the replica has two major activities:
+
+```text
+Source
+  |
+  v
+Receive
+  |
+  v
+Apply
+```
+
+Modern MySQL exposes replication status that helps you determine whether receiving and applying are functioning correctly.
+
+Use:
+
+```sql
+SHOW REPLICA STATUS\G
+```
+
+---
+
+# 15. Important Replication Status
+
+On a replica:
+
+```sql
+SHOW REPLICA STATUS\G
+```
+
+Pay attention to fields such as:
+
+```text
+Replica_IO_Running
+Replica_SQL_Running
+Seconds_Behind_Source
+Last_IO_Error
+Last_SQL_Error
+Retrieved_Gtid_Set
+Executed_Gtid_Set
+```
+
+Exact fields can vary by MySQL release.
+
+---
+
+# 16. Healthy Replication
+
+A simplified healthy state:
+
+```text
+IO thread       = running
+SQL thread      = running
+Errors          = none
+Lag             = acceptable
+```
+
+Conceptually:
+
+```text
+SOURCE
+  |
+  | continuously
+  v
+REPLICA
+  |
+  +-- Receiving ✓
+  +-- Applying  ✓
+  +-- Lag       Low
+```
+
+---
+
+# 17. Replication Lag
+
+Suppose:
+
+```text
+Source:
+Transaction 1000
+
+Replica:
+Transaction 950
+```
+
+The replica is behind.
+
+This is:
+
+> **Replication lag**
+
+---
+
+# 18. Why Replication Lag Happens
+
+Common causes:
+
+```text
+Heavy write workload
+Slow replica disk
+Insufficient CPU
+Large transactions
+Long-running queries
+Lock contention
+Network problems
+DDL
+Poor configuration
+Replica overloaded by reporting
+```
+
+---
+
+# 19. `Seconds_Behind_Source`
+
+You may see:
+
+```text
+Seconds_Behind_Source: 25
+```
+
+This can be useful, but:
+
+> **Don't treat it as a perfect measurement of replication health.**
+
+Replication lag is more complicated than one number.
+
+You should also inspect:
+
+```text
+GTID progress
+Transaction backlog
+IO state
+SQL/apply state
+Network
+Disk
+Locks
+```
+
+---
+
+# 20. Example Replication Problem
+
+Suppose:
+
+```text
+SOURCE
+Writes: 10,000 txn/sec
+
+REPLICA
+Applies: 6,000 txn/sec
+```
+
+Backlog grows:
+
+```text
+4,000 txn/sec
+```
+
+Eventually:
+
+```text
+Replication lag
+      ↑
+      ↑
+      ↑
+```
+
+The replica cannot keep up.
+
+---
+
+# 21. Reporting Can Cause Lag
+
+Imagine:
+
+```text
+Application writes
+      |
+      v
+Source
+      |
+      v
+Replica
+      |
+      +--> Huge reporting query
+```
+
+The reporting query consumes:
+
+```text
+CPU
+Memory
+Disk
+Locks
+```
+
+and replication may slow down.
+
+This is why read replicas aren't automatically free capacity.
+
+---
+
+# 22. Read Scaling
+
+Suppose application workload is:
+
+```text
+80% reads
+20% writes
+```
+
+You could potentially use:
+
+```text
+               Application
+                /       \
+              Write     Read
+                |         |
+                v         v
+             Source    Replica
+```
+
+This can reduce read pressure on the source.
+
+But your application must correctly handle:
+
+* Read-after-write consistency
+* Replica lag
+* Transactions
+* Routing
+
+---
+
+# 23. Read-After-Write Problem
+
+User performs:
+
+```text
+INSERT order
+    ↓
+Source
+```
+
+Immediately:
+
+```text
+SELECT order
+    ↓
+Replica
+```
+
+If replication hasn't caught up:
+
+```text
+Order not found
+```
+
+The application may think the insert failed.
+
+This is a classic distributed-systems issue.
+
+---
+
+# 24. Read Routing
+
+A better design may use:
+
+```text
+WRITE
+  ↓
+SOURCE
+
+CRITICAL READ
+  ↓
+SOURCE
+
+EVENTUAL READ
+  ↓
+REPLICA
+```
+
+Not every query should automatically go to a replica.
+
+---
+
+# 25. Read-Only Replicas
+
+For a reporting replica, you may configure it to prevent accidental writes.
+
+Check:
+
+```sql
+SHOW VARIABLES LIKE 'read_only';
+```
+
+Also understand:
+
+```sql
+SHOW VARIABLES LIKE 'super_read_only';
+```
+
+These settings have important operational implications.
+
+---
+
+# 26. `super_read_only`
+
+`super_read_only` provides stronger protection against accidental writes by privileged users.
+
+Conceptually:
+
+```text
+Application
+     |
+     X
+Replica writes blocked
+```
+
+This can help protect replicas.
+
+But administrative operations and replication behavior have special considerations.
+
+Always understand exactly what you're changing before enabling/disabling it.
+
+---
+
+# 27. Replication Security
+
+Replication requires authentication between servers.
+
+You should use:
+
+```text
+Dedicated replication account
+Strong authentication
+TLS where appropriate
+Least privilege
+Restricted network access
+```
+
+Don't use:
+
+```text
+root
+```
+
+as your replication account.
+
+---
+
+# 28. Network Security
+
+Example:
+
+```text
+Source
+10.0.1.10
+    |
+    | TCP 3306
+    |
+    v
+Replica
+10.0.2.10
+```
+
+Firewall rules should allow only the required communication.
+
+Don't expose MySQL unnecessarily to the internet.
+
+---
+
+# 29. TLS
+
+For sensitive environments, replication traffic should be protected appropriately.
+
+Conceptually:
+
+```text
+Source
+  |
+  | Encrypted replication
+  v
+Replica
+```
+
+This protects replication traffic from network-level interception.
+
+---
+
+# 30. High Availability vs Replication
+
+This distinction is extremely important.
+
+Replication:
+
+```text
+Source → Replica
+```
+
+doesn't automatically provide:
+
+```text
+Automatic failover
+Traffic management
+Application routing
+Leader election
+Failure detection
+```
+
+Therefore:
+
+> **Replication is a building block for HA, not necessarily HA by itself.**
+
+---
+
+# 31. High Availability
+
+HA means the system is designed to remain available despite certain failures.
+
+Conceptually:
+
+```text
+                Application
+                     |
+                HA Endpoint
+                     |
+              +------+------+
+              |             |
+           MySQL A       MySQL B
+            Active        Standby
+```
+
+If A fails:
+
+```text
+A
+X
+
+B
+↓
+Active
+```
+
+---
+
+# 32. Failover vs Switchover
+
+### Failover
+
+Unplanned failure:
+
+```text
+Primary
+   X
+   ↓
+Replica becomes primary
+```
+
+### Switchover
+
+Planned role change:
+
+```text
+Primary
+   ↓
+Controlled transition
+   ↓
+Replica becomes primary
+```
+
+Example:
+
+```text
+Maintenance
+    ↓
+Switchover
+    ↓
+Patch old primary
+```
+
+---
+
+# 33. Switchover Is Safer
+
+If you know:
+
+```text
+Tomorrow 2 AM
+```
+
+you can prepare.
+
+You can:
+
+```text
+Stop writes
+Check replication
+Confirm target is caught up
+Promote target
+Redirect application
+```
+
+Failover happens when something has already gone wrong.
+
+---
+
+# 34. Planned Switchover
+
+Conceptually:
+
+```text
+PRIMARY A
+   |
+   | Replication
+   v
+REPLICA B
+```
+
+Before switch:
+
+```text
+A = Primary
+B = Replica
+```
+
+After:
+
+```text
+B = Primary
+A = Replica
+```
+
+This is useful for:
+
+```text
+Maintenance
+Patching
+Hardware replacement
+OS migration
+Datacenter maintenance
+```
+
+---
+
+# 35. Failover Scenario
+
+Imagine:
+
+```text
+Application
+     |
+     v
+Primary
+     X
+```
+
+You need:
+
+```text
+Replica
+   ↓
+Promote
+   ↓
+Application redirected
+```
+
+But promotion isn't the only problem.
+
+You also need to consider:
+
+```text
+DNS
+Connection pools
+Application configuration
+Writes
+Old primary recovery
+Replication topology
+Data consistency
+```
+
+---
+
+# 36. Split Brain
+
+One of the most dangerous HA scenarios.
+
+Imagine:
+
+```text
+Node A thinks:
+"I am Primary."
+
+Node B thinks:
+"I am Primary."
+```
+
+Now both accept writes.
+
+```text
+Application A
+     |
+     v
+Primary A
+     ↑
+     |
+  writes
+
+Application B
+     |
+     v
+Primary B
+     ↑
+     |
+  writes
+```
+
+You can create divergent data.
+
+This is:
+
+> **Split brain**
+
+HA systems need mechanisms to prevent or minimize this risk.
+
+---
+
+# 37. Why Fencing Matters
+
+When a primary is considered dead, you need confidence it isn't still serving traffic.
+
+Conceptually:
+
+```text
+Old Primary
+    |
+    X
+Fence / isolate
+    |
+    v
+Promote Replica
+```
+
+Otherwise:
+
+```text
+Old Primary
+    +
+New Primary
+    =
+Potential split brain
+```
+
+---
+
+# 38. DR — Disaster Recovery
+
+DR is broader than HA.
+
+HA handles things like:
+
+```text
+Server failure
+```
+
+DR considers:
+
+```text
+Datacenter loss
+Region loss
+Major corruption
+Ransomware
+Human error
+Infrastructure destruction
+```
+
+Example:
+
+```text
+Primary DC
+     |
+     | Replication/backup
+     v
+DR DC
+```
+
+---
+
+# 39. RPO
+
+RPO:
+
+> **Recovery Point Objective**
+
+It answers:
+
+> How much data can the business afford to lose?
+
+Example:
+
+```text
+RPO = 5 minutes
+```
+
+Means the recovery strategy should aim to lose no more than approximately five minutes of data under the defined failure scenario.
+
+---
+
+# 40. RTO
+
+RTO:
+
+> **Recovery Time Objective**
+
+It answers:
+
+> How quickly must service be restored?
+
+Example:
+
+```text
+RTO = 30 minutes
+```
+
+Your DR architecture must be designed around this requirement.
+
+---
+
+# 41. RPO/RTO Example
+
+Business says:
+
+```text
+RPO = 1 minute
+RTO = 15 minutes
+```
+
+Your architecture must support those targets.
+
+A solution requiring:
+
+```text
+8 hours to restore
+```
+
+doesn't meet the RTO.
+
+A solution that loses:
+
+```text
+2 hours of data
+```
+
+doesn't meet the RPO.
+
+---
+
+# 42. Backup + Replication + DR
+
+A mature environment may have:
+
+```text
+                 SOURCE
+                    |
+          +---------+---------+
+          |                   |
+          v                   v
+      REPLICA             BACKUP
+          |                   |
+          v                   v
+       HA/DR              Offsite
+```
+
+Each solves different problems.
+
+```text
+Replication → availability
+Backup      → recovery
+Offsite     → disaster protection
+```
+
+---
+
+# 43. Disaster Recovery Example
+
+Primary:
+
+```text
+New Orleans DC
+```
+
+DR:
+
+```text
+Dallas DC
+```
+
+Conceptually:
+
+```text
+Production
+    |
+    | Replication
+    v
+DR MySQL
+```
+
+If the primary site is lost:
+
+```text
+Production DC
+     X
+
+DR DC
+  ↓
+Promote
+  ↓
+Application
+```
+
+The exact architecture depends on network, latency, business requirements, and operational tooling.
+
+---
+
+# 44. Replication Failure — Scenario 1
+
+You run:
+
+```sql
+SHOW REPLICA STATUS\G
+```
+
+and see:
+
+```text
+Replica_IO_Running: No
+Replica_SQL_Running: Yes
+```
+
+Interpretation:
+
+```text
+Replica is applying existing events
+but isn't receiving new events.
+```
+
+Potential causes:
+
+```text
+Network problem
+Source unavailable
+Authentication failure
+TLS issue
+Source binary log unavailable
+Replication configuration problem
+```
+
+Check:
+
+```text
+Last_IO_Error
+```
+
+---
+
+# 45. Replication Failure — Scenario 2
+
+Suppose:
+
+```text
+Replica_IO_Running: Yes
+Replica_SQL_Running: No
+```
+
+Now:
+
+```text
+Receiving = working
+Applying = stopped
+```
+
+Potential causes:
+
+```text
+SQL error
+Duplicate key
+Missing object
+Permission issue
+Data inconsistency
+DDL problem
+```
+
+Check:
+
+```text
+Last_SQL_Error
+```
+
+---
+
+# 46. Example SQL Error
+
+Suppose replication stops because:
+
+```text
+Duplicate entry
+```
+
+Don't immediately run:
+
+```text
+"Skip the error"
+```
+
+This is dangerous.
+
+You first need to determine:
+
+```text
+Why did source and replica diverge?
+```
+
+Skipping transactions can make corruption/divergence worse.
+
+---
+
+# 47. Never Use "Skip Errors" as a Default Fix
+
+Bad DBA behavior:
+
+```text
+Replication stopped
+       ↓
+Skip transaction
+       ↓
+Start replication
+       ↓
+Problem solved!
+```
+
+No.
+
+Correct:
+
+```text
+Replication stopped
+       ↓
+Investigate
+       ↓
+Determine cause
+       ↓
+Assess data consistency
+       ↓
+Repair appropriately
+       ↓
+Resume
+```
+
+---
+
+# 48. Replication Monitoring
+
+Monitor:
+
+```text
+Replication state
+Lag
+GTID progress
+SQL errors
+IO errors
+Network
+Disk
+CPU
+Transactions
+```
+
+For production, create alerts for:
+
+```text
+Replication stopped
+Replication lag exceeds threshold
+Disk nearly full
+Binary logs at risk
+```
+
+---
+
+# 49. Disk Space and Replication
+
+A very dangerous situation:
+
+```text
+Replica disk
+    ↓
+95%
+    ↓
+Replication continues
+    ↓
+100%
+    ↓
+MySQL/replication problems
+```
+
+Monitor:
+
+```bash
+df -h
+```
+
+on Linux.
+
+On Windows, monitor the volume containing:
+
+```text
+Data
+Logs
+Binary logs
+Relay logs
+```
+
+---
+
+# 50. Binary Log Retention
+
+Binary logs consume disk.
+
+You need an appropriate retention policy.
+
+Too short:
+
+```text
+Required recovery logs disappear
+```
+
+Too long:
+
+```text
+Disk fills
+```
+
+So:
+
+```text
+Retention
+     =
+Recovery requirements
++
+Replication requirements
++
+Available storage
+```
+
+---
+
+# 51. Replication and Backups
+
+A good architecture can be:
+
+```text
+Primary
+   |
+   +---- Replica
+   |
+   +---- Backup
+```
+
+But backup can also be performed from an appropriate replica depending on the architecture.
+
+Advantages:
+
+```text
+Reduced source load
+```
+
+But you must ensure:
+
+```text
+Backup consistency
+Replication health
+Backup completeness
+```
+
+---
+
+# 52. HA Testing
+
+You don't have HA because a diagram says:
+
+```text
+Primary
+Replica
+```
+
+You have HA when you've tested:
+
+```text
+Primary failure
+     ↓
+Detection
+     ↓
+Promotion
+     ↓
+Application reconnection
+     ↓
+Data validation
+```
+
+Do this in a controlled test environment first.
+
+---
+
+# 53. Disaster Recovery Testing
+
+At least periodically:
+
+```text
+Simulate disaster
+       ↓
+Recover database
+       ↓
+Recover application
+       ↓
+Validate data
+       ↓
+Measure RTO
+       ↓
+Measure RPO
+```
+
+If your stated RTO is:
+
+```text
+30 minutes
+```
+
+but the last test took:
+
+```text
+2 hours
+```
+
+your DR plan doesn't meet its requirement.
+
+---
+
+# 54. Complete HA Architecture
+
+A mature architecture might look like:
+
+```text
+                 Application
+                      |
+                HA Endpoint
+                      |
+              +-------+-------+
+              |               |
+         MySQL Primary    MySQL Replica
+              |               |
+              |               |
+              +-------+-------+
+                      |
+                 Backup System
+                      |
+                      v
+                 Offsite/DR
+```
+
+In larger environments, a dedicated HA/orchestration layer may manage:
+
+```text
+Health checks
+Leader election
+Promotion
+Routing
+Fencing
+Topology
+```
+
+---
+
+# 55. MySQL InnoDB Cluster
+
+For modern MySQL HA, you should know the concept of **InnoDB Cluster**.
+
+It uses MySQL Group Replication and MySQL Router to build a managed HA architecture.
+
+Conceptually:
+
+```text
+          Application
+               |
+        MySQL Router
+               |
+       +-------+-------+
+       |       |       |
+      DB1     DB2     DB3
+       |       |       |
+       +-------+-------+
+        Group Replication
+```
+
+This is more sophisticated than simply configuring one source and one replica.
+
+---
+
+# 56. Group Replication
+
+Group Replication allows multiple MySQL servers to participate in a group.
+
+Conceptually:
+
+```text
+        +--------+
+        | Node 1 |
+        +--------+
+           /  \
+          /    \
+         /      \
++--------+      +--------+
+| Node 2 |------| Node 3 |
++--------+      +--------+
+```
+
+The group coordinates membership and transaction replication.
+
+It forms the foundation of several MySQL HA architectures.
+
+---
+
+# 57. MySQL Router
+
+Applications ideally shouldn't need to know:
+
+```text
+Which node is currently primary?
+```
+
+Instead:
+
+```text
+Application
+     |
+     v
+MySQL Router
+     |
+     +----> Primary
+     |
+     +----> Read replicas
+```
+
+Router can help direct connections according to the topology.
+
+This simplifies application-side failover handling.
+
+---
+
+# 58. HA vs Read Scaling
+
+Don't confuse:
+
+```text
+Read Scaling
+```
+
+with:
+
+```text
+High Availability
+```
+
+Example:
+
+```text
+Primary
+   |
+   +-- Replica 1
+   +-- Replica 2
+   +-- Replica 3
+```
+
+This may improve read capacity.
+
+But if the primary dies and nobody can promote/re-route:
+
+```text
+Availability = still poor
+```
+
+HA requires operational failover capability.
+
+---
+
+# 59. Production HA Checklist
+
+```text
+[ ] Replication tested
+[ ] GTID configured appropriately
+[ ] Monitoring configured
+[ ] Alerting configured
+[ ] Backup configured
+[ ] Offsite backup
+[ ] RPO defined
+[ ] RTO defined
+[ ] Failover procedure documented
+[ ] Switchover procedure documented
+[ ] Fencing considered
+[ ] Application reconnect tested
+[ ] DNS/Router strategy tested
+[ ] DR tested
+```
+
+---
+
+# 60. Hands-On Lab — Build a Two-Server Replica
+
+Use:
+
+```text
+VM1
+Source
+10.0.0.10
+
+VM2
+Replica
+10.0.0.20
+```
+
+Both:
+
+```text
+MySQL
+Same major/release family
+```
+
+For a lab, make sure both machines can communicate over the MySQL port.
+
+---
+
+# 61. Source Configuration
+
+Enable binary logging using your version-appropriate configuration.
+
+Conceptually:
+
+```ini
+[mysqld]
+server-id=1
+log_bin=mysql-bin
+```
+
+For a modern GTID-based configuration, additional settings are required.
+
+For example, conceptually:
+
+```ini
+gtid_mode=ON
+enforce_gtid_consistency=ON
+```
+
+Do **not** paste production configuration blindly; settings must be validated for your exact MySQL release and topology.
+
+Restart MySQL after configuration changes where required.
+
+---
+
+# 62. Replica Configuration
+
+Conceptually:
+
+```ini
+[mysqld]
+server-id=2
+```
+
+Ensure the replica has a unique server ID.
+
+Never configure:
+
+```text
+Source server-id = 1
+Replica server-id = 1
+```
+
+Every replication server needs an appropriate unique identity.
+
+---
+
+# 63. Create Replication User
+
+On source:
+
+```sql
+CREATE USER 'repl'@'10.0.0.%'
+IDENTIFIED BY 'StrongReplicationPassword';
+```
+
+Grant the privileges required by your MySQL version and replication configuration.
+
+Then verify:
+
+```sql
+SHOW GRANTS FOR 'repl'@'10.0.0.%';
+```
+
+Use a narrowly scoped network range in real environments rather than an unnecessarily broad one.
+
+---
+
+# 64. Establish Replication
+
+Modern MySQL supports GTID-based replication configuration.
+
+The exact commands depend on:
+
+```text
+MySQL version
+GTID settings
+Source/replica state
+Authentication
+TLS
+Existing data
+```
+
+The important conceptual workflow is:
+
+```text
+1. Prepare source
+2. Prepare replica
+3. Seed replica
+4. Configure replication
+5. Start replication
+6. Verify status
+7. Generate test transaction
+8. Confirm it arrives
+```
+
+Don't blindly execute replication commands copied from an old MySQL 5.7 tutorial against MySQL 8.x.
+
+---
+
+# 65. Test Replication
+
+On source:
+
+```sql
+CREATE DATABASE replication_lab;
+```
+
+Then:
+
+```sql
+USE replication_lab;
+```
+
+```sql
+CREATE TABLE test_data
+(
+    id INT PRIMARY KEY,
+    message VARCHAR(100)
+);
+```
+
+Then:
+
+```sql
+INSERT INTO test_data
+VALUES (1, 'Replication works');
+```
+
+On replica:
+
+```sql
+SHOW DATABASES;
+```
+
+Then:
+
+```sql
+SELECT *
+FROM replication_lab.test_data;
+```
+
+You should see the replicated row.
+
+---
+
+# 66. Test Failure
+
+In a lab:
+
+```text
+Stop replication
+```
+
+Generate writes on source.
+
+Observe:
+
+```text
+Source
+  |
+  | transactions
+  v
+Replica
+  X
+```
+
+Then resume replication.
+
+Observe the backlog catch up.
+
+This gives you hands-on experience with replication lag.
+
+---
+
+# 67. Simulate Failover
+
+In a lab:
+
+```text
+Source
+  X
+```
+
+Then practice:
+
+```text
+1. Detect failure
+2. Confirm source unavailable
+3. Ensure replica is sufficiently caught up
+4. Promote replica
+5. Point application to new source
+6. Validate writes
+```
+
+Do not experiment with failover procedures on production without a formally tested runbook.
+
+---
+
+# 68. The DBA Mental Model
+
+You should now think of MySQL like this:
+
+```text
+                 MYSQL
+                   |
+       +-----------+-----------+
+       |           |           |
+     Backup     Replica       HA
+       |           |           |
+      DR        Scaling      Failover
+       |           |           |
+       +-----------+-----------+
+                   |
+             Application
+```
+
+Every component solves a different problem.
+
+---
+
+# 69. Lesson 8 Interview Questions
+
+Be prepared for:
+
+1. What is MySQL replication?
+2. What is a binary log?
+3. What is a relay log?
+4. What is GTID?
+5. Why is GTID useful?
+6. What is replication lag?
+7. What causes replication lag?
+8. How do you check replication status?
+9. What is `Replica_IO_Running`?
+10. What is `Replica_SQL_Running`?
+11. What is `Seconds_Behind_Source`?
+12. Why isn't replication a backup?
+13. What is read scaling?
+14. What is read-after-write consistency?
+15. What is the difference between failover and switchover?
+16. What is split brain?
+17. What is fencing?
+18. What is RPO?
+19. What is RTO?
+20. How would you design a DR environment?
+21. How would you troubleshoot a stopped IO thread?
+22. How would you troubleshoot a stopped SQL thread?
+23. Why shouldn't you blindly skip replication errors?
+24. What is Group Replication?
+25. What is InnoDB Cluster?
+26. What is MySQL Router?
+27. How would you test HA?
+28. How would you test DR?
+29. How would you patch a replicated environment?
+30. How would you perform a planned switchover?
+
+---
+
+# Your 10-Lesson Progress
+
+```text
+✅ Lesson 1 — Architecture & DBA Fundamentals
+✅ Lesson 2 — Installation & Configuration
+✅ Lesson 3 — Security, Users & Privileges
+✅ Lesson 4 — Backup, Restore & Disaster Recovery
+✅ Lesson 5 — Monitoring, Performance & Troubleshooting
+✅ Lesson 6 — Patching & Version Management
+✅ Lesson 7 — Migration
+✅ Lesson 8 — Replication, HA & DR
+⬜ Lesson 9 — Advanced InnoDB, Security & Production Operations
+⬜ Lesson 10 — Complete Production DBA
+```
+
+## Next: Lesson 9
+
+We'll move into the **advanced DBA layer**:
+
+**InnoDB internals → buffer pool → redo/undo → transactions → locking → deadlocks → indexes → tablespaces → online schema changes → security hardening → auditing → resource management → production troubleshooting → OS-level administration.**
