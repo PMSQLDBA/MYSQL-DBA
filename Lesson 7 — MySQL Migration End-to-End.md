@@ -1,4 +1,4 @@
-# Lesson 7 of 10 — MySQL Migration End-to-End
+# Lesson 7 — MySQL Migration End-to-End
 
 Today we cover **migration**, one of the most important real-world DBA skills.
 
